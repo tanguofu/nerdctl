@@ -384,31 +384,25 @@ func (m *containerNetworkManager) VerifyNetworkOptions(_ context.Context) error 
 	return nil
 }
 
-// Returns the relevant paths of the `hostname`, `resolv.conf`, and `hosts` files
-// in the datastore of the container with the given ID.
-func (m *containerNetworkManager) getContainerNetworkFilePaths(containerID string) (string, string, string, error) {
-	dataStore, err := clientutil.DataStore(m.globalOptions.DataRoot, m.globalOptions.Address)
-	if err != nil {
-		return "", "", "", err
+// getNetworkFilePathsFromSpec extracts the host paths for hostname, resolv.conf, and hosts
+// from the container's OCI spec mounts. This is useful for --net=container mode where we
+// want to reuse the target container's network configuration files directly.
+// Returns empty strings for any files not found in mounts.
+func getNetworkFilePathsFromSpec(spec *specs.Spec) (hostnamePath, resolvConfPath, etcHostsPath string) {
+	if spec == nil {
+		return "", "", ""
 	}
-	conStateDir, err := ContainerStateDirPath(m.globalOptions.Namespace, dataStore, containerID)
-	if err != nil {
-		return "", "", "", err
+	for _, mount := range spec.Mounts {
+		switch mount.Destination {
+		case "/etc/hostname":
+			hostnamePath = mount.Source
+		case "/etc/resolv.conf":
+			resolvConfPath = mount.Source
+		case "/etc/hosts":
+			etcHostsPath = mount.Source
+		}
 	}
-	hostsStore, err := hostsstore.New(dataStore, m.globalOptions.Namespace)
-	if err != nil {
-		return "", "", "", err
-	}
-
-	hostnamePath := filepath.Join(conStateDir, "hostname")
-	resolvConfPath := filepath.Join(conStateDir, "resolv.conf")
-
-	etcHostsPath, err := hostsStore.HostsPath(containerID)
-	if err != nil {
-		return "", "", "", err
-	}
-
-	return hostnamePath, resolvConfPath, etcHostsPath, nil
+	return hostnamePath, resolvConfPath, etcHostsPath
 }
 
 // SetupNetworking Performs setup actions required for the container with the given ID.
@@ -501,9 +495,14 @@ func (m *containerNetworkManager) ContainerNetworkingOpts(ctx context.Context, _
 		return nil, nil, err
 	}
 
-	hostnamePath, resolvConfPath, etcHostsPath, err := m.getContainerNetworkFilePaths(containerID)
-	if err != nil {
-		return nil, nil, err
+	// Get the network file paths directly from the target container's spec mounts.
+	// This allows us to reuse the network configuration files from CRI/Kubernetes
+	// containers which don't have files in nerdctl's datastore.
+	hostnamePath, resolvConfPath, etcHostsPath := getNetworkFilePathsFromSpec(s)
+
+	// Verify that at least resolv.conf exists, as it's essential for DNS resolution
+	if resolvConfPath == "" {
+		return nil, nil, fmt.Errorf("target container %s does not have /etc/resolv.conf mounted", containerID)
 	}
 
 	opts = append(opts,
@@ -512,10 +511,18 @@ func (m *containerNetworkManager) ContainerNetworkingOpts(ctx context.Context, _
 			Path: netNSPath,
 		}),
 		withCustomResolvConf(resolvConfPath),
-		withCustomHosts(etcHostsPath),
 		oci.WithHostname(hostname),
-		withCustomEtcHostname(hostnamePath),
 	)
+
+	// Only mount /etc/hosts if the target container has it mounted
+	if etcHostsPath != "" {
+		opts = append(opts, withCustomHosts(etcHostsPath))
+	}
+
+	// Only mount /etc/hostname if the target container has it mounted
+	if hostnamePath != "" {
+		opts = append(opts, withCustomEtcHostname(hostnamePath))
+	}
 
 	return opts, cOpts, nil
 }
